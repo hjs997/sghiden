@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os,re,sys,time,random,requests
+import os, re, sys, time, random, requests
 try:
     from patchright.sync_api import sync_playwright
     USING_PATCHRIGHT = True
@@ -50,7 +50,6 @@ def get_current_ip(proxy_server=None):
     proxies = {"http": proxy_server, "https": proxy_server} if (proxy_server and IS_PROXY) else None
     try:
         resp = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
-        # log(f"请求出口IP完成, status={resp.status_code}")
         if resp.status_code == 200:
             return resp.text.strip()
         return "获取失败"
@@ -58,7 +57,7 @@ def get_current_ip(proxy_server=None):
         log(f"❌ 获取出口IP失败: {e}")
         return "获取失败"
 
-def send_telegram_notification(status, old_due, new_due, current_ip="未知"):
+def send_telegram_notification(status, old_due="未知", new_due="未知", current_ip="未知"):
     """发送 Telegram 通知"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log("⚠️ Telegram 未配置，跳过通知")
@@ -74,7 +73,7 @@ def send_telegram_notification(status, old_due, new_due, current_ip="未知"):
         else:
             masked_email = f"{name}@{domain}"
     else:
-        masked_email = EMAIL[:2] + '****'
+        masked_email = (EMAIL[:2] + '****') if EMAIL else "未配置邮箱"
 
     text = (
         f"🎉 HidenCloud 续期通知\n\n"
@@ -102,6 +101,25 @@ def send_telegram_notification(status, old_due, new_due, current_ip="未知"):
     except Exception as e:
         log(f"❌ Telegram 通知异常: {e}")
         return False
+
+def _remove_overlays(page):
+    """移除页面上遮挡按钮的 Cookie 隐私横幅 (#ncmp__tool) 等悬浮层"""
+    try:
+        page.evaluate(
+            """
+            () => {
+                if (!document.getElementById('hide-ncmp-style')) {
+                    const style = document.createElement('style');
+                    style.id = 'hide-ncmp-style';
+                    style.innerHTML = '#ncmp__tool, .ncmp__banner-inner, .ncmp__normalise { display: none !important; pointer-events: none !important; visibility: hidden !important; z-index: -9999 !important; }';
+                    document.head.appendChild(style);
+                }
+                document.querySelectorAll('#ncmp__tool, .ncmp__banner-inner').forEach(el => el.remove());
+            }
+            """
+        )
+    except Exception:
+        pass
 
 def _get_turnstile_token(page):
     """读取 Turnstile 验证通过后生成的响应 token，未通过时返回 None"""
@@ -162,6 +180,7 @@ def _cf_checkbox_visible(page):
 
 def _click_cf_checkbox(page, frame_el=None):
     """点击 Cloudflare/Turnstile 复选框：先试框架内元素（含嵌套 iframe），失败退化为坐标点击"""
+    _remove_overlays(page)
     for frame in page.frames:
         if 'challenges.cloudflare.com' not in (frame.url or ''):
             continue
@@ -228,6 +247,7 @@ def _has_interstitial_iframe(page):
 
 def _click_security_submit(page):
     """安全验证页 token 已生成但仍停在验证页时，尝试点击确认/继续按钮"""
+    _remove_overlays(page)
     for text in ('Verify', 'Continue', 'Submit', 'Proceed', '验证'):
         try:
             btn = page.locator(f'button:has-text("{text}"):visible, input[type="submit"]:visible').first
@@ -246,13 +266,10 @@ def _dump_security_page(page):
         srcs = page.evaluate(
             "() => Array.from(document.querySelectorAll('iframe')).map(f => f.src).filter(Boolean)"
         )
-
         buttons = page.evaluate(
             "() => Array.from(document.querySelectorAll('button, input[type=submit], a.btn')).map(b => (b.innerText || b.value || '').trim()).filter(t => t && t.length < 40)"
         )
-        # log(f"🔍 验证页按钮: {buttons}")
         body = page.evaluate("() => document.body ? document.body.innerText.slice(0, 200) : ''")
-        # log(f"🔍 验证页正文: {body}")
     except Exception as e:
         log(f"🔍 验证页信息采集失败: {e}")
 
@@ -280,8 +297,7 @@ def handle_cloudflare(page, timeout=240):
     while time.time() - start_time < effective_timeout:
         if not challenge_active():
             clear_rounds += 1
-            if clear_rounds >= 2: 
-                # log("✅ Turnstile 安全验证通过！")
+            if clear_rounds >= 2:
                 return True
             time.sleep(1)
             continue
@@ -298,7 +314,6 @@ def handle_cloudflare(page, timeout=240):
                     time.sleep(random.uniform(3, 5))
                     continue
             elif _get_turnstile_token(page) and _is_security_check_page(page):
-                # token 已生成但页面仍停在验证页：可能需要手动点确认按钮
                 if _click_security_submit(page):
                     last_click = time.time()
                     time.sleep(random.uniform(2, 4))
@@ -318,6 +333,7 @@ def solve_modal_turnstile(page, timeout=90):
     clicks = 0
     no_frame_seconds = 0
     while time.time() - start < timeout:
+        _remove_overlays(page)
         # 1) token 已生成 → 验证通过
         if _get_turnstile_token(page):
             log("✅ Turnstile 验证通过！")
@@ -419,8 +435,9 @@ def login(page):
             handle_cloudflare(page, timeout=240)
             time.sleep(2)
             handle_cloudflare(page, timeout=60)  # 跳转后可能再次出现验证页
+            _remove_overlays(page)
             if _is_logged_in(page):
-                log(f"✅ Cookie 登录成功！当前已到达dashboard页面")
+                log("✅ Cookie 登录成功！当前已到达dashboard页面")
                 return True
             log("❌ Cookie 失效，请更换")
         except Exception as e:
@@ -433,9 +450,9 @@ def login(page):
     try:
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page, timeout=240)
-        time.sleep(8) # 等页面完全加载
+        time.sleep(8)  # 等页面完全加载
+        _remove_overlays(page)
         log("⌨️ 输入账号密码...")
-        # 真实表单字段：input[name="username"]（可填邮箱或用户名）/ input[name="password"]
         user_input = page.locator('input[name="username"], input[name="email"], input[type="email"]').first
         pwd_input = page.locator('input[name="password"], input[type="password"]').first
         try:
@@ -447,17 +464,22 @@ def login(page):
         pwd_input.fill(PASSWORD, timeout=10000)
         time.sleep(0.5)
         handle_cloudflare(page, timeout=60)
-        
+        _remove_overlays(page)
+
         # 登录表单自带 Turnstile，提交前先等它的 token
         if not solve_modal_turnstile(page, timeout=90):
             log("⚠️ 登录表单的 Turnstile 未确认通过，仍将尝试提交...")
-        
+
         log("🖱️ 点击登录按钮提交...")
-        time.sleep(3) # 等Turnstile完全通过
+        time.sleep(3)  # 等Turnstile完全通过
+        _remove_overlays(page)
         try:
-            page.click('button[type="submit"]', timeout=10000)
+            page.click('button[type="submit"]', timeout=5000)
         except Exception:
-            page.locator('button:has-text("Sign in"), button:has-text("登录")').first.click(timeout=10000)
+            try:
+                page.click('button[type="submit"]', force=True, timeout=5000)
+            except Exception:
+                page.locator('button:has-text("Sign in"), button:has-text("登录")').first.click(force=True, timeout=5000)
         time.sleep(3)
         handle_cloudflare(page, timeout=240)
         nav_start = time.time()
@@ -478,14 +500,15 @@ def login(page):
             return False
         page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page, timeout=120)
+        _remove_overlays(page)
         page_title = page.title()
         log(f"📝 当前Title: {page_title}")
         if not _is_logged_in(page):
             log("❌ 登录失败。")
             status = "❌ 登录失败"
-            send_telegram_notification(status)  # 发送 Telegram 通知 
+            send_telegram_notification(status)
             return False
-        log(f"✅ 账号密码登录成功！当前已到达dashboard页面")
+        log("✅ 账号密码登录成功！当前已到达dashboard页面")
         return True
     except Exception as e:
         log(f"❌ 登录异常: {e}")
@@ -501,6 +524,7 @@ def get_server_id(page):
             time.sleep(2)
         handle_cloudflare(page)
         time.sleep(3)
+        _remove_overlays(page)
         html = page.content()
         log(f"📝 页面长度: {len(html)}, URL: {page.url}")
 
@@ -520,7 +544,7 @@ def get_server_id(page):
 
         log("❌ 所有 URL 均未找到 Server ID")
         status = "❌ 未获取到server ID, 检查服务是否被删除"
-        send_telegram_notification(status)  # 发送 Telegram 通知 
+        send_telegram_notification(status)
         return None
     except Exception as e:
         log(f"❌ 获取 Server ID 失败: {e}")
@@ -532,6 +556,7 @@ def get_due_date(page):
         if SERVICE_URL not in page.url:
             page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
+        _remove_overlays(page)
         body_text = page.locator("body").inner_text()
         patterns = [
             r"Due date\s+(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
@@ -549,29 +574,40 @@ def get_due_date(page):
     return "未知"
 
 def renew_service(page):
-
     try:
         log("➡ 进入续期流程...")
         if page.url != SERVICE_URL:
             page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
-        time.sleep(12) # 等待续期页面完全加载,未完全加载无法点击
+        time.sleep(12)  # 等待续期页面完全加载,未完全加载无法点击
+
+        # 清理可能遮挡按钮的 Cookie 隐私横幅
+        _remove_overlays(page)
+
         log("🖱️ 准备点击 Renew 按钮...")
         renew_btn = page.locator('button:has-text("Renew")')
         create_btn = page.locator('button:has-text("Create Invoice")')
         modal_opened = False
         for i in range(6):
             try:
+                _remove_overlays(page)
                 renew_btn.wait_for(state="visible", timeout=10000)
                 renew_btn.scroll_into_view_if_needed()
                 log(f"🖱️ 第 {i+1} 次尝试点击 Renew...")
-                renew_btn.click()
-                time.sleep(3) # 等待一小段时间，检测是否出现“未到续期时间”弹窗
+                try:
+                    renew_btn.click(timeout=5000)
+                except Exception:
+                    try:
+                        renew_btn.click(force=True, timeout=5000)
+                    except Exception:
+                        renew_btn.first.evaluate("el => el.click()")
+
+                time.sleep(3)  # 等待一小段时间，检测是否出现“未到续期时间”弹窗
                 page_text = page.locator("body").inner_text()
                 if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
                     log("⚠️ 未到续期时间，无法续期。")
                     page.screenshot(path="renew_not_allowed.png")
-                    return "NOT_TIME" 
+                    return "NOT_TIME"
 
                 log("🖲️ 等待弹窗出现...")
                 try:
@@ -579,7 +615,7 @@ def renew_service(page):
                     modal_opened = True
                     log("✅ 弹窗已成功弹出！")
                     break
-                except:
+                except Exception:
                     log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
                     time.sleep(2)
             except Exception as e:
@@ -592,6 +628,7 @@ def renew_service(page):
 
         # 弹窗内先完成 Turnstile 人机验证，再提交
         handle_cloudflare(page, timeout=60)
+        _remove_overlays(page)
         if not solve_modal_turnstile(page, timeout=90):
             log("⚠️ Turnstile 未确认通过，仍将尝试提交...")
             page.screenshot(path="turnstile_timeout.png")
@@ -602,8 +639,16 @@ def renew_service(page):
         for attempt in range(6):
             log(f"🖱️ 点击 Create Invoice（第 {attempt + 1} 次）...")
             try:
+                _remove_overlays(page)
                 create_btn.wait_for(state="visible", timeout=30000)
-                create_btn.click(timeout=20000)
+                try:
+                    create_btn.click(timeout=5000)
+                except Exception:
+                    log("ℹ️ 常规点击被遮挡，改用强制点击...")
+                    try:
+                        create_btn.click(force=True, timeout=5000)
+                    except Exception:
+                        create_btn.first.evaluate("el => el.click()")
             except Exception as e:
                 log(f"⚠️ 点击 Create Invoice 失败: {e}")
                 solve_modal_turnstile(page, timeout=45)
@@ -637,12 +682,19 @@ def renew_service(page):
         handle_cloudflare(page)
 
         log("🔎 查找 Pay 按钮...")
+        _remove_overlays(page)
         pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
         pay_btn.wait_for(state="visible", timeout=30000)
-        pay_btn.click()
+        try:
+            pay_btn.click(timeout=5000)
+        except Exception:
+            try:
+                pay_btn.click(force=True, timeout=5000)
+            except Exception:
+                pay_btn.evaluate("el => el.click()")
         log("✅ Pay 按钮已点击")
-        time.sleep(6) # 等待支付确认页面或跳转回服务页
-        page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000) # 返回服务管理页面以获取新的到期时间
+        time.sleep(6)  # 等待支付确认页面或跳转回服务页
+        page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)  # 返回服务管理页面以获取新的到期时间
         handle_cloudflare(page)
         return True
 
@@ -673,7 +725,7 @@ def main():
             current_ip = get_current_ip(PROXY_SERVER)
             log(f"🎯 当前出口IP: {current_ip}")
 
-            log("🚀 启动反检测内核浏览器...") # 使用patchright 反检测内核
+            log("🚀 启动反检测内核浏览器...")  # 使用patchright 反检测内核
             browser, page = open_browser(p)
 
             if not login(page):
